@@ -26,17 +26,30 @@ jobs:
       - name: Build with Gradle
         run: ./gradlew assembleRelease -P "version=${{ github.ref_name }}"
 
-      # 步骤1：定位未签名APK并解析所在目录（核心修复）
-      - name: Locate unsigned APKs and directories
+      # 步骤1：定位未签名APK
+      - name: Locate unsigned APKs
         id: locate_unsigned_apks
         run: |
-          # 查找Normal版本未签名APK并解析目录
-          normal_unsigned=$(find app/build/outputs/apk/normal/release -name "*.apk" | head -n 1)
-          normal_dir=$(dirname "$normal_unsigned")  # 用Shell解析目录路径
+          # 查找Normal版本未签名APK
+          normal_unsigned=$(find app/build/outputs/apk/normal/release -name "*.apk" ! -name "*-signed.apk" | head -n 1)
+          normal_dir=$(dirname "$normal_unsigned")
           
-          # 查找Compatible版本未签名APK并解析目录
-          compatible_unsigned=$(find app/build/outputs/apk/compatible/release -name "*.apk" | head -n 1)
-          compatible_dir=$(dirname "$compatible_unsigned")  # 用Shell解析目录路径
+          # 查找Compatible版本未签名APK
+          compatible_unsigned=$(find app/build/outputs/apk/compatible/release -name "*.apk" ! -name "*-signed.apk" | head -n 1)
+          compatible_dir=$(dirname "$compatible_unsigned")
+          
+          # 调试输出
+          echo "Normal APK: $normal_unsigned"
+          echo "Normal Dir: $normal_dir"
+          echo "Compatible APK: $compatible_unsigned"
+          echo "Compatible Dir: $compatible_dir"
+          
+          # 验证文件存在
+          if [ -z "$normal_unsigned" ] || [ -z "$compatible_unsigned" ]; then
+            echo "Error: Unsigned APKs not found"
+            find app/build/outputs/apk -type f -name "*.apk" 2>/dev/null || echo "No APK files found"
+            exit 1
+          fi
           
           # 输出变量供后续步骤使用
           echo "normal_unsigned=$normal_unsigned" >> $GITHUB_OUTPUT
@@ -44,50 +57,76 @@ jobs:
           echo "compatible_unsigned=$compatible_unsigned" >> $GITHUB_OUTPUT
           echo "compatible_dir=$compatible_dir" >> $GITHUB_OUTPUT
 
-      # 步骤2：签名Normal版本APK（引用解析后的目录）
+      # 步骤2：签名Normal版本APK
       - name: Sign Normal APK
         id: sign_normal
         uses: ilharp/sign-android-release@v2
         with:
-          releaseDir: ${{ steps.locate_unsigned_apks.outputs.normal_dir }}  # 使用提前解析的目录
+          releaseDir: ${{ steps.locate_unsigned_apks.outputs.normal_dir }}
           signingKey: ${{ secrets.ANDROID_SIGNING_KEY }}
           keyAlias: ${{ secrets.ANDROID_KEY_ALIAS }}
           keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
           buildToolsVersion: 34.0.0
 
-      # 步骤3：签名Compatible版本APK（引用解析后的目录）
+      # 步骤3：签名Compatible版本APK
       - name: Sign Compatible APK
         id: sign_compatible
         uses: ilharp/sign-android-release@v2
         with:
-          releaseDir: ${{ steps.locate_unsigned_apks.outputs.compatible_dir }}  # 使用提前解析的目录
+          releaseDir: ${{ steps.locate_unsigned_apks.outputs.compatible_dir }}
           signingKey: ${{ secrets.ANDROID_SIGNING_KEY }}
           keyAlias: ${{ secrets.ANDROID_KEY_ALIAS }}
           keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
           buildToolsVersion: 34.0.0
 
-      # 步骤4：生成签名后APK的校验和
-      - name: Generate signed APK checksums
+      # 步骤4：验证并生成签名后APK的校验和
+      - name: Verify and generate checksums
+        id: checksums
         run: |
-          echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-          # 为Normal版本生成校验和
-          sha256sum ${{ steps.sign_normal.outputs.signedFile }} > "CHECKSUMS-Sesame-Normal-${{ github.ref_name }}.${{ env.SHORT_SHA }}-signed.sha256"
-          # 为Compatible版本生成校验和
-          sha256sum ${{ steps.sign_compatible.outputs.signedFile }} > "CHECKSUMS-Sesame-Compatible-${{ github.ref_name }}.${{ env.SHORT_SHA }}-signed.sha256"
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_ENV
+          
+          # 查找签名后的APK文件
+          NORMAL_SIGNED=$(find app/build/outputs/apk/normal/release -name "*-signed.apk" | head -n 1)
+          COMPATIBLE_SIGNED=$(find app/build/outputs/apk/compatible/release -name "*-signed.apk" | head -n 1)
+          
+          # 调试输出
+          echo "Normal Signed APK: $NORMAL_SIGNED"
+          echo "Compatible Signed APK: $COMPATIBLE_SIGNED"
+          
+          # 验证文件存在
+          if [ -z "$NORMAL_SIGNED" ] || [ -z "$COMPATIBLE_SIGNED" ]; then
+            echo "Error: Signed APKs not found"
+            find app/build/outputs/apk -type f -name "*.apk"
+            exit 1
+          fi
+          
+          # 验证文件实际存在
+          if [ ! -f "$NORMAL_SIGNED" ] || [ ! -f "$COMPATIBLE_SIGNED" ]; then
+            echo "Error: Signed APK files don't exist"
+            exit 1
+          fi
+          
+          # 生成校验和文件
+          sha256sum "$NORMAL_SIGNED" > "CHECKSUMS-Sesame-Normal-${{ github.ref_name }}.$SHORT_SHA-signed.sha256"
+          sha256sum "$COMPATIBLE_SIGNED" > "CHECKSUMS-Sesame-Compatible-${{ github.ref_name }}.$SHORT_SHA-signed.sha256"
+          
+          # 输出文件路径供后续步骤使用
+          echo "normal_signed=$NORMAL_SIGNED" >> $GITHUB_OUTPUT
+          echo "compatible_signed=$COMPATIBLE_SIGNED" >> $GITHUB_OUTPUT
 
       # 步骤5：上传签名后的APK及校验和到Release
       - name: Upload signed assets to Release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.event.release.tag_name }}
+          tag_name: ${{ github.ref_name }}
           files: |
-            ${{ steps.sign_normal.outputs.signedFile }}
-            ${{ steps.sign_compatible.outputs.signedFile }}
+            ${{ steps.checksums.outputs.normal_signed }}
+            ${{ steps.checksums.outputs.compatible_signed }}
             CHECKSUMS-Sesame-Normal-${{ github.ref_name }}.${{ env.SHORT_SHA }}-signed.sha256
             CHECKSUMS-Sesame-Compatible-${{ github.ref_name }}.${{ env.SHORT_SHA }}-signed.sha256
-          tag_name: ${{ github.ref_name }}
           draft: false
           append_body: true
           generate_release_notes: true
@@ -95,7 +134,15 @@ jobs:
             ## ✨What's Changed
 
             ${{ github.event.head_commit.message || github.event.pull_request.title || '无详细信息' }}
-            > ## 下载说明
-              * Normal 为正常版本,适用于`Android 8.0`及以上的系统
-              * Compatible 为兼容版本,适用于`Android 7.0`不再向下兼容 参考minSDK24后续不再兼容`
-            > 倒卖必死全家
+            
+            ## 📥 下载说明
+            
+            * **Normal** 为正常版本，适用于 Android 8.0 及以上系统
+            * **Compatible** 为兼容版本，适用于 Android 7.0（minSDK24）
+            
+            ## ✅ 校验文件完整性
+            
+            ```bash
+            sha256sum -c CHECKSUMS-Sesame-Normal-*.sha256
+            sha256sum -c CHECKSUMS-Sesame-Compatible-*.sha256
+            ```
