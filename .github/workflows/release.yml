@@ -1,148 +1,331 @@
-name: Android CI
+name: Release Build
+run-name: Release Build - ${{ github.ref_name }}
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "[0-9]*-*"
+
+env:
+  CI: "true"
+  JAVA_DISTRIBUTION: "temurin"
+  JAVA_VERSION: "17"
+  ANDROID_API_LEVEL: "34"
+  ANDROID_BUILD_TOOLS: "34.0.0"
+  RELEASE_DIR: app/build/outputs/apk/release
+  STAGING_DIR: app/build/outputs/apk/all
+  ASSET_DIR: app/build/outputs/apk/release-assets
+  ARTIFACT_PASSWORD: Sesame-GR
+  RELEASE_TAG_RAW: ${{ github.ref_name }}
+  TARGET_SOURCE_BRANCH: main
+  PUBLISH_TO_XPOSED_REPO: "false"
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
-  build:
+  preflight:
     runs-on: ubuntu-latest
-    environment: production
+    permissions:
+      contents: read
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+      reason: ${{ steps.check.outputs.reason }}
+      tag_valid: ${{ steps.meta.outputs.tag_valid }}
+      tag_version_code: ${{ steps.meta.outputs.tag_version_code }}
+      version_name: ${{ steps.meta.outputs.version_name }}
+      version_code: ${{ steps.meta.outputs.version_code }}
+
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.ref }}
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v3
+      - name: Resolve Release Metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag_regex='^([0-9]+)-(.+)$'
+          tag_valid="false"
+          tag_version_code=""
+          version_name=""
+
+          if [[ "${RELEASE_TAG_RAW}" =~ ${release_tag_regex} ]]; then
+            tag_valid="true"
+            tag_version_code="${BASH_REMATCH[1]}"
+            version_name="${BASH_REMATCH[2]}"
+          fi
+
+          version_code="$(git rev-list --count HEAD | tr -d '\n')"
+          if [[ -z "${version_code}" ]]; then
+            echo "Failed to resolve versionCode from git history" >&2
+            exit 1
+          fi
+
+          echo "tag_valid=${tag_valid}" >> "$GITHUB_OUTPUT"
+          echo "tag_version_code=${tag_version_code}" >> "$GITHUB_OUTPUT"
+          echo "version_name=${version_name}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${version_code}" >> "$GITHUB_OUTPUT"
+
+      - name: Check Signing And Target Repository
+        id: check
+        shell: bash
+        env:
+          TAG_VALID: ${{ steps.meta.outputs.tag_valid }}
+          TAG_VERSION_CODE: ${{ steps.meta.outputs.tag_version_code }}
+          VERSION_NAME: ${{ steps.meta.outputs.version_name }}
+          VERSION_CODE: ${{ steps.meta.outputs.version_code }}
+          ANDROID_SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin "refs/heads/${TARGET_SOURCE_BRANCH}:refs/remotes/origin/${TARGET_SOURCE_BRANCH}" --force
+
+          missing=()
+          [[ -n "${ANDROID_SIGNING_KEY}" ]] || missing+=("ANDROID_SIGNING_KEY")
+          [[ -n "${ANDROID_KEY_ALIAS}" ]] || missing+=("ANDROID_KEY_ALIAS")
+          [[ -n "${ANDROID_KEYSTORE_PASSWORD}" ]] || missing+=("ANDROID_KEYSTORE_PASSWORD")
+          [[ -n "${ANDROID_KEY_PASSWORD}" ]] || missing+=("ANDROID_KEY_PASSWORD")
+
+          ready="false"
+          reason=""
+
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            reason="缺少必要 Secrets: ${missing[*]}"
+          elif [[ "${TAG_VALID}" != "true" ]]; then
+            reason="标签 ${RELEASE_TAG_RAW} 不符合 VersionCode-VersionName 格式"
+          elif [[ "${TAG_VERSION_CODE}" != "${VERSION_CODE}" ]]; then
+            reason="标签中的 versionCode (${TAG_VERSION_CODE}) 与当前提交计算得到的 versionCode (${VERSION_CODE}) 不一致"
+          elif ! git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${TARGET_SOURCE_BRANCH}"; then
+            reason="标签 ${RELEASE_TAG_RAW} 指向的提交不在 ${TARGET_SOURCE_BRANCH} 分支上"
+          else
+            ready="true"
+            reason="预检通过"
+          fi
+
+          echo "ready=${ready}" >> "$GITHUB_OUTPUT"
+          {
+            echo "reason<<EOF"
+            printf '%s\n' "${reason}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Release Preflight"
+            echo
+            echo "- 触发事件: \`push(tag)\`"
+            echo "- 源仓库标签: \`${RELEASE_TAG_RAW}\`"
+            echo "- 校验分支: \`${TARGET_SOURCE_BRANCH}\`"
+            echo "- 标签格式有效: \`${TAG_VALID}\`"
+            echo "- 标签中的版本号: \`${TAG_VERSION_CODE}\`"
+            echo "- 版本名称: \`${VERSION_NAME}\`"
+            echo "- 版本号: \`${VERSION_CODE}\`"
+            echo "- 检查结果: ${reason}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: preflight
+    if: needs.preflight.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          architecture: x64
+          check-latest: false
           cache: gradle
 
+      - name: Pin Gradle Java Home
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ORG_GRADLE_JAVA_HOME=${JAVA_HOME}" >> "$GITHUB_ENV"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      - name: Install Required Android SDK Packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}"
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
+
       - name: Grant execute permission for gradlew
+        shell: bash
         run: chmod +x gradlew
 
-      - name: Build with Gradle
-        run: ./gradlew assembleRelease -P "version=${{ github.ref_name }}"
-
-      # 步骤1：定位未签名APK
-      - name: Locate unsigned APKs
-        id: locate_unsigned_apks
+      - name: Print Toolchain Versions
+        shell: bash
         run: |
-          # 查找Normal版本未签名APK
-          normal_unsigned=$(find app/build/outputs/apk/normal/release -name "*.apk" ! -name "*-signed.apk" | head -n 1)
-          normal_dir=$(dirname "$normal_unsigned")
-          
-          # 查找Compatible版本未签名APK
-          compatible_unsigned=$(find app/build/outputs/apk/compatible/release -name "*.apk" ! -name "*-signed.apk" | head -n 1)
-          compatible_dir=$(dirname "$compatible_unsigned")
-          
-          # 调试输出
-          echo "Normal APK: $normal_unsigned"
-          echo "Normal Dir: $normal_dir"
-          echo "Compatible APK: $compatible_unsigned"
-          echo "Compatible Dir: $compatible_dir"
-          
-          # 验证文件存在
-          if [ -z "$normal_unsigned" ] || [ -z "$compatible_unsigned" ]; then
-            echo "Error: Unsigned APKs not found"
-            find app/build/outputs/apk -type f -name "*.apk" 2>/dev/null || echo "No APK files found"
+          set -euo pipefail
+          echo "JAVA_HOME=${JAVA_HOME}"
+          echo "ORG_GRADLE_JAVA_HOME=${ORG_GRADLE_JAVA_HOME}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
+          java -version
+          sdkmanager --version
+          ./gradlew --version
+
+      - name: Build Release APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --stacktrace assembleRelease
+
+      - name: Stage Unsigned APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "${STAGING_DIR}" "${ASSET_DIR}"
+          mkdir -p "${STAGING_DIR}"
+          mapfile -t apks < <(find "${RELEASE_DIR}" -maxdepth 1 -type f -name "*.apk" | sort)
+          if [[ ${#apks[@]} -eq 0 ]]; then
+            echo "No release APKs found in ${RELEASE_DIR}" >&2
             exit 1
           fi
-          
-          # 输出变量供后续步骤使用
-          echo "normal_unsigned=$normal_unsigned" >> $GITHUB_OUTPUT
-          echo "normal_dir=$normal_dir" >> $GITHUB_OUTPUT
-          echo "compatible_unsigned=$compatible_unsigned" >> $GITHUB_OUTPUT
-          echo "compatible_dir=$compatible_dir" >> $GITHUB_OUTPUT
+          for apk in "${apks[@]}"; do
+            cp "${apk}" "${STAGING_DIR}/"
+          done
 
-      # 步骤2：签名Normal版本APK
-      - name: Sign Normal APK
-        id: sign_normal
+      - name: Sign APKs
+        id: sign_apks
         uses: ilharp/sign-android-release@v2
         with:
-          releaseDir: ${{ steps.locate_unsigned_apks.outputs.normal_dir }}
+          releaseDir: ${{ env.STAGING_DIR }}
           signingKey: ${{ secrets.ANDROID_SIGNING_KEY }}
           keyAlias: ${{ secrets.ANDROID_KEY_ALIAS }}
           keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          buildToolsVersion: 34.0.0
+          buildToolsVersion: ${{ env.ANDROID_BUILD_TOOLS }}
 
-      # 步骤3：签名Compatible版本APK
-      - name: Sign Compatible APK
-        id: sign_compatible
-        uses: ilharp/sign-android-release@v2
-        with:
-          releaseDir: ${{ steps.locate_unsigned_apks.outputs.compatible_dir }}
-          signingKey: ${{ secrets.ANDROID_SIGNING_KEY }}
-          keyAlias: ${{ secrets.ANDROID_KEY_ALIAS }}
-          keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          buildToolsVersion: 34.0.0
-
-      # 步骤4：验证并生成签名后APK的校验和
-      - name: Verify and generate checksums
-        id: checksums
+      - name: Generate Release Notes
+        id: release_notes
+        shell: bash
+        env:
+          GITHUB_API_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_ENV
-          
-          # 查找签名后的APK文件
-          NORMAL_SIGNED=$(find app/build/outputs/apk/normal/release -name "*-signed.apk" | head -n 1)
-          COMPATIBLE_SIGNED=$(find app/build/outputs/apk/compatible/release -name "*-signed.apk" | head -n 1)
-          
-          # 调试输出
-          echo "Normal Signed APK: $NORMAL_SIGNED"
-          echo "Compatible Signed APK: $COMPATIBLE_SIGNED"
-          
-          # 验证文件存在
-          if [ -z "$NORMAL_SIGNED" ] || [ -z "$COMPATIBLE_SIGNED" ]; then
-            echo "Error: Signed APKs not found"
-            find app/build/outputs/apk -type f -name "*.apk"
-            exit 1
-          fi
-          
-          # 验证文件实际存在
-          if [ ! -f "$NORMAL_SIGNED" ] || [ ! -f "$COMPATIBLE_SIGNED" ]; then
-            echo "Error: Signed APK files don't exist"
-            exit 1
-          fi
-          
-          # 生成校验和文件
-          sha256sum "$NORMAL_SIGNED" > "CHECKSUMS-Sesame-Normal-${{ github.ref_name }}.$SHORT_SHA-signed.sha256"
-          sha256sum "$COMPATIBLE_SIGNED" > "CHECKSUMS-Sesame-Compatible-${{ github.ref_name }}.$SHORT_SHA-signed.sha256"
-          
-          # 输出文件路径供后续步骤使用
-          echo "normal_signed=$NORMAL_SIGNED" >> $GITHUB_OUTPUT
-          echo "compatible_signed=$COMPATIBLE_SIGNED" >> $GITHUB_OUTPUT
+          set -euo pipefail
 
-      # 步骤5：上传签名后的APK及校验和到Release
-      - name: Upload signed assets to Release
+          body_path="${RUNNER_TEMP}/release-body.md"
+          repo_name="${REPOSITORY#*/}"
+          prev_tag="$(git describe --tags --abbrev=0 "${GITHUB_SHA}^" 2>/dev/null || true)"
+          commit_history_url="https://github.com/${REPOSITORY}/commits/${RELEASE_TAG_RAW}"
+          compare_url=""
+          commit_range_display="首次发布（完整历史）"
+          range_args=("${GITHUB_SHA}")
+
+          if [[ -n "${prev_tag}" ]]; then
+            compare_url="https://github.com/${REPOSITORY}/compare/${prev_tag}...${RELEASE_TAG_RAW}"
+            commit_range_display="${prev_tag}...${RELEASE_TAG_RAW}"
+            range_args=("${prev_tag}..${GITHUB_SHA}")
+          fi
+
+          {
+            echo "内容同步自源仓库 [${repo_name}](https://github.com/${REPOSITORY})"
+            echo
+            echo "源仓库标签：\`${RELEASE_TAG_RAW}\`"
+            echo "变更范围：\`${commit_range_display}\`"
+            echo
+            echo "## 变更说明"
+            echo
+            git log --oneline "${range_args[@]}"
+            echo
+            echo "## 完整日志"
+            echo
+            if [[ -n "${compare_url}" ]]; then
+              echo "- 对比视图：${compare_url}"
+            fi
+            echo "- 提交历史：${commit_history_url}"
+            echo
+            echo "## 下载说明"
+            echo
+            echo "**- Normal 版本:** 适用于 Android 8.0 及以上系统"
+            echo "**- Compatible 版本:** 适用于 Android 7.0 (minSDK24) 及以上系统"
+            echo
+            echo "如果不确定，请下载 **Normal** 版本。"
+          } > "${body_path}"
+
+          echo "body_path=${body_path}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Release Assets
+        id: prepare_assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${ASSET_DIR}"
+          IFS=':' read -r -a files <<< "${{ steps.sign_apks.outputs.signedFiles }}"
+          copied=0
+          for file in "${files[@]}"; do
+            [[ -n "${file}" ]] || continue
+            cp "${file}" "${ASSET_DIR}/"
+            (
+              cd "${ASSET_DIR}"
+              sha256sum "$(basename "${file}")" > "CHECKSUMS-$(basename "${file}").sha256"
+            )
+            copied=$((copied + 1))
+          done
+          if [[ ${copied} -eq 0 ]]; then
+            echo "No signed APKs were produced" >&2
+            exit 1
+          fi
+          cp "${{ steps.release_notes.outputs.body_path }}" "${ASSET_DIR}/RELEASE_NOTES-${RELEASE_TAG_RAW}.md"
+          echo "asset_dir=${ASSET_DIR}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Signed APKs to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           files: |
-            ${{ steps.checksums.outputs.normal_signed }}
-            ${{ steps.checksums.outputs.compatible_signed }}
-            CHECKSUMS-Sesame-Normal-${{ github.ref_name }}.${{ env.SHORT_SHA }}-signed.sha256
-            CHECKSUMS-Sesame-Compatible-${{ github.ref_name }}.${{ env.SHORT_SHA }}-signed.sha256
+            ${{ steps.prepare_assets.outputs.asset_dir }}/*
           draft: false
-          append_body: true
-          generate_release_notes: true
-          body: |
-            ## ✨What's Changed
+          prerelease: false
+          make_latest: true
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          body_path: ${{ steps.release_notes.outputs.body_path }}
 
-            ${{ github.event.head_commit.message || github.event.pull_request.title || '无详细信息' }}
-            
-            ## 📥 下载说明
-            
-            * **Normal** 为正常版本，适用于 Android 8.0 及以上系统
-            * **Compatible** 为兼容版本，适用于 Android 7.0（minSDK24）
-            
-            ## ✅ 校验文件完整性
-            
-            ```bash
-            sha256sum -c CHECKSUMS-Sesame-Normal-*.sha256
-            sha256sum -c CHECKSUMS-Sesame-Compatible-*.sha256
-            ```
+  skip:
+    needs: preflight
+    if: needs.preflight.outputs.ready != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Report Skip Reason
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Release workflow skipped: ${{ needs.preflight.outputs.reason }}"
+          {
+            echo "## Release Skipped"
+            echo
+            echo "- 原因: ${{ needs.preflight.outputs.reason }}"
+          } >> "$GITHUB_STEP_SUMMARY"
